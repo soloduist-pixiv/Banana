@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+torch
+torchvision
+Pillow
+numpy
+matplotlib
+scipy
+asyncpg
+PyJWT
