@@ -5,7 +5,21 @@ class Config:
     UPLOAD_FOLDER = 'uploads'
     MODEL_PATH = '5个模型的训练结果/shufflenet_v2/best_model.pth'
     SECRET_KEY = 'your-secret-key'
-    
+
+    # 数据库配置 — 笨蛋到服务器上改
+    class DatabaseConfig:
+        DB_HOST = "your-server-ip"
+        DB_PORT = 5432
+        DB_NAME = "banana"
+        DB_USER = "postgres"
+        DB_PASSWORD = "your-password"
+
+    # JWT 配置
+    class JWTConfig:
+        SECRET = "your-jwt-secret"
+        ALGORITHM = "HS256"
+        EXPIRE_HOURS = 24
+
     # 确保上传目录存在
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
