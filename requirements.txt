@@ -1,4 +1,5 @@
 fastapi
+starlette>=0.40.0,<0.48.0
 uvicorn
 torch
 torchvision
