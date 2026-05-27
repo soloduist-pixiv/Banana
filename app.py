@@ -15,6 +15,9 @@ from virtual_orchard import CLASS_NAMES
 import random
 import uvicorn
 import shutil
+from database import init_db, close_db
+from auth import verify_user, create_token
+from pydantic import BaseModel
 
 config = DevelopmentConfig()
 
@@ -27,6 +30,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class LoginRequest(BaseModel):
+    account: str
+    password: str
+
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await close_db()
+
 
 os.makedirs(config.UPLOAD_FOLDER, exist_ok=True)
 
@@ -154,6 +173,19 @@ disease_features = [
 
 # 存储会话数据
 session_data = {}
+
+@app.post("/api/login")
+async def login(body: LoginRequest):
+    user = await verify_user(body.account, body.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="账号或密码错误")
+    token = create_token(user["id"], user["description"])
+    return JSONResponse(content={
+        "id": user["id"],
+        "description": user["description"],
+        "token": token,
+    })
+
 
 @app.get("/api/health")
 async def health():
