@@ -1,4 +1,6 @@
 from fastapi import FastAPI, Request, Form, File, UploadFile, HTTPException
+from typing import List
+import json
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from config import DevelopmentConfig, ProductionConfig
@@ -404,6 +406,99 @@ async def is_banana(file: UploadFile = File(...)):
         
     except Exception as e:
         return JSONResponse(content={"error": f"处理失败：{str(e)}"}, status_code=500)
+
+
+@app.post("/api/exeupload")
+async def exe_upload(
+    account_id: str = Form(...),
+    json_data: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """
+    EXE客户端批量上传接口
+
+    接收账号ID、JSON元数据描述、以及多张图片文件。
+    文件按 image/{account_id}/{00001}/ 结构存储，
+    JSON元数据保存为 metadata.json。
+    """
+    try:
+        # 校验 account_id 安全性（防路径穿越）
+        if not account_id or not account_id.strip():
+            return JSONResponse(content={"error": "账号ID不能为空"}, status_code=400)
+        account_id = account_id.strip()
+        if any(c in account_id for c in ('/', '\\', '..')):
+            return JSONResponse(content={"error": "账号ID包含非法字符"}, status_code=400)
+
+        # 解析 JSON
+        try:
+            metadata_list = json.loads(json_data)
+        except json.JSONDecodeError:
+            return JSONResponse(content={"error": "JSON数据格式错误"}, status_code=400)
+
+        if not isinstance(metadata_list, list):
+            return JSONResponse(content={"error": "JSON数据应为数组格式"}, status_code=400)
+
+        if not files:
+            return JSONResponse(content={"error": "未上传任何文件"}, status_code=400)
+
+        # 构建 filename -> metadata 映射
+        filename_map = {}
+        for item in metadata_list:
+            fname = item.get("filename", "")
+            if fname:
+                filename_map[fname] = item
+
+        # 确定账号文件夹路径
+        account_folder = os.path.join(config.IMAGE_FOLDER, account_id)
+        os.makedirs(account_folder, exist_ok=True)
+
+        # 计算下一次上传编号
+        existing_dirs = [
+            d for d in os.listdir(account_folder)
+            if os.path.isdir(os.path.join(account_folder, d)) and d.isdigit()
+        ]
+        next_num = max([int(d) for d in existing_dirs], default=0) + 1
+        upload_folder_name = f"{next_num:05d}"
+        upload_folder = os.path.join(account_folder, upload_folder_name)
+        os.makedirs(upload_folder, exist_ok=True)
+
+        saved_files = []
+        unmatched_files = []
+
+        for file in files:
+            if not file.filename:
+                continue
+
+            match = filename_map.get(file.filename)
+            if match:
+                save_name = match.get("new_filename", file.filename)
+            else:
+                save_name = file.filename
+                unmatched_files.append(file.filename)
+
+            save_path = os.path.join(upload_folder, save_name)
+            with open(save_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            saved_files.append(save_name)
+
+        # 保存 metadata.json
+        metadata_path = os.path.join(upload_folder, "metadata.json")
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata_list, f, ensure_ascii=False, indent=2)
+
+        return JSONResponse(content={
+            "success": True,
+            "account_id": account_id,
+            "upload_number": next_num,
+            "folder": f"image/{account_id}/{upload_folder_name}",
+            "files_saved": saved_files,
+            "total_files": len(saved_files),
+            "unmatched_files": unmatched_files if unmatched_files else None
+        })
+
+    except Exception as e:
+        return JSONResponse(content={"error": f"上传失败：{str(e)}"}, status_code=500)
 
 
 @app.get("/api/result")
