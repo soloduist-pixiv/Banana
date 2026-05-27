@@ -1,7 +1,8 @@
 from fastapi import FastAPI, Request, Form, File, UploadFile, HTTPException
 from typing import List
 import json
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
 from config import DevelopmentConfig, ProductionConfig
 import os
@@ -482,10 +483,15 @@ async def exe_upload(
 
             saved_files.append(save_name)
 
-        # 保存 metadata.json
+        # 保存 metadata.json（带时间戳）
         metadata_path = os.path.join(upload_folder, "metadata.json")
+        metadata_wrapper = {
+            "uploaded_at": datetime.now().isoformat(),
+            "upload_number": next_num,
+            "records": metadata_list
+        }
         with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(metadata_list, f, ensure_ascii=False, indent=2)
+            json.dump(metadata_wrapper, f, ensure_ascii=False, indent=2)
 
         return JSONResponse(content={
             "success": True,
@@ -499,6 +505,120 @@ async def exe_upload(
 
     except Exception as e:
         return JSONResponse(content={"error": f"上传失败：{str(e)}"}, status_code=500)
+
+
+@app.get("/api/exeupload/history")
+async def exe_upload_history(account_id: str):
+    """
+    查询账号的上传记录列表
+
+    扫描 image/{account_id}/ 下所有上传文件夹，
+    读取 metadata.json 并返回汇总信息。
+    """
+    try:
+        if not account_id or not account_id.strip():
+            return JSONResponse(content={"error": "账号ID不能为空"}, status_code=400)
+        account_id = account_id.strip()
+        if any(c in account_id for c in ('/', '\\', '..')):
+            return JSONResponse(content={"error": "账号ID包含非法字符"}, status_code=400)
+
+        account_folder = os.path.join(config.IMAGE_FOLDER, account_id)
+
+        if not os.path.exists(account_folder):
+            return JSONResponse(content={
+                "success": True,
+                "account_id": account_id,
+                "total_uploads": 0,
+                "uploads": []
+            })
+
+        uploads = []
+        for folder_name in sorted(os.listdir(account_folder)):
+            folder_path = os.path.join(account_folder, folder_name)
+            if not os.path.isdir(folder_path) or not folder_name.isdigit():
+                continue
+
+            metadata_path = os.path.join(folder_path, "metadata.json")
+            uploaded_at = None
+            file_count = 0
+            records = []
+
+            if os.path.exists(metadata_path):
+                try:
+                    with open(metadata_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    # 兼容新旧格式
+                    if isinstance(meta, dict) and "records" in meta:
+                        uploaded_at = meta.get("uploaded_at")
+                        records = meta.get("records", [])
+                    elif isinstance(meta, list):
+                        records = meta
+                except (json.JSONDecodeError, Exception):
+                    records = []
+
+            # 统计文件夹内的图片文件
+            image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+            image_files = [
+                f for f in os.listdir(folder_path)
+                if os.path.splitext(f)[1].lower() in image_extensions
+            ]
+            file_count = len(image_files)
+
+            # 组装每条记录的摘要
+            record_summaries = []
+            for rec in records:
+                record_summaries.append({
+                    "id": rec.get("id"),
+                    "filename": rec.get("filename"),
+                    "new_filename": rec.get("new_filename"),
+                    "disease_en": rec.get("disease_en"),
+                    "disease_zh": rec.get("disease_zh"),
+                    "confidence": rec.get("confidence")
+                })
+
+            uploads.append({
+                "upload_number": int(folder_name),
+                "folder_name": folder_name,
+                "uploaded_at": uploaded_at,
+                "file_count": file_count,
+                "records": record_summaries
+            })
+
+        return JSONResponse(content={
+            "success": True,
+            "account_id": account_id,
+            "total_uploads": len(uploads),
+            "uploads": uploads
+        })
+
+    except Exception as e:
+        return JSONResponse(content={"error": f"查询失败：{str(e)}"}, status_code=500)
+
+
+@app.get("/api/exeupload/image/{account_id}/{upload_folder}/{filename}")
+async def exe_upload_image(account_id: str, upload_folder: str, filename: str):
+    """
+    获取上传的图片文件
+
+    路径参数对应 image/{account_id}/{upload_folder}/{filename}
+    """
+    try:
+        if any(c in account_id for c in ('/', '\\', '..')):
+            return JSONResponse(content={"error": "账号ID包含非法字符"}, status_code=400)
+        if any(c in upload_folder for c in ('/', '\\', '..')):
+            return JSONResponse(content={"error": "上传文件夹名包含非法字符"}, status_code=400)
+        if any(c in filename for c in ('/', '\\')):
+            return JSONResponse(content={"error": "文件名包含非法字符"}, status_code=400)
+
+        file_path = os.path.join(config.IMAGE_FOLDER, account_id, upload_folder, filename)
+
+        if not os.path.exists(file_path):
+            return JSONResponse(content={"error": "文件不存在"}, status_code=404)
+
+        return FileResponse(file_path)
+
+    except Exception as e:
+        return JSONResponse(content={"error": f"获取文件失败：{str(e)}"}, status_code=500)
 
 
 @app.get("/api/result")
