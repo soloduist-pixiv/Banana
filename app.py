@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Form, File, UploadFile, HTTPException
+from fastapi import FastAPI, Depends, Request, Form, File, UploadFile, HTTPException
 from typing import List
 import json
 from fastapi.responses import JSONResponse, FileResponse
@@ -6,6 +6,7 @@ from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
 from config import DevelopmentConfig, ProductionConfig
 import os
+import re
 import torch
 import torch.nn as nn
 from torchvision import transforms, models
@@ -15,8 +16,9 @@ from virtual_orchard import CLASS_NAMES
 import random
 import uvicorn
 import shutil
+import secrets
 from database import init_db, close_db
-from auth import verify_user, create_token
+from auth import verify_user, create_token, get_current_user
 from pydantic import BaseModel
 
 config = DevelopmentConfig()
@@ -179,9 +181,10 @@ async def login(body: LoginRequest):
     user = await verify_user(body.account, body.password)
     if user is None:
         raise HTTPException(status_code=401, detail="账号或密码错误")
-    token = create_token(user["id"], user["description"])
+    token = create_token(user["id"], user["account"], user["description"])
     return JSONResponse(content={
         "id": user["id"],
+        "account": user["account"],
         "description": user["description"],
         "token": token,
     })
@@ -651,6 +654,226 @@ async def exe_upload_image(account_id: str, upload_folder: str, filename: str):
 
     except Exception as e:
         return JSONResponse(content={"error": f"获取文件失败：{str(e)}"}, status_code=500)
+
+
+@app.post("/api/localupload")
+async def local_upload(
+    user: dict = Depends(get_current_user),
+    num: int = Form(...),
+    rows: int = Form(...),
+    cols: int = Form(...),
+    selected_disease: str = Form(...),
+    overall_confidence: float = Form(...),
+    records: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """
+    小程序批量上传接口（JWT 鉴权）
+
+    接收果园参数、病害选择、采样识别结果 JSON 以及多张叶片图片。
+    文件存储为 image/{account_id}/{timestamp_folder}/ 结构，
+    图片重命名为随机 hash，元数据保存为 metadata.json。
+    """
+    try:
+        account_id = user.get("account", "")
+        if not account_id or any(c in account_id for c in ('/', '\\', '..')):
+            return JSONResponse(content={"error": "账号ID无效"}, status_code=400)
+
+        # 解析 records JSON
+        try:
+            records_list = json.loads(records)
+        except json.JSONDecodeError:
+            return JSONResponse(content={"error": "records JSON格式错误"}, status_code=400)
+
+        if not isinstance(records_list, list):
+            return JSONResponse(content={"error": "records 应为数组格式"}, status_code=400)
+
+        if not files:
+            return JSONResponse(content={"error": "未上传任何文件"}, status_code=400)
+
+        # 构建 filename -> record 映射
+        filename_to_record = {}
+        for rec in records_list:
+            fname = rec.get("filename", "")
+            if fname:
+                filename_to_record[fname] = rec
+
+        # 创建上传目录
+        account_folder = os.path.join(config.IMAGE_FOLDER, account_id)
+        os.makedirs(account_folder, exist_ok=True)
+
+        # upload_number = 已有目录数 + 1
+        existing_dirs = [
+            d for d in os.listdir(account_folder)
+            if os.path.isdir(os.path.join(account_folder, d))
+        ]
+        upload_number = len(existing_dirs) + 1
+
+        # 时间戳文件夹名（num_前缀标识第几次本地检测）
+        folder_name = f"{num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        upload_folder = os.path.join(account_folder, folder_name)
+        os.makedirs(upload_folder, exist_ok=True)
+
+        # 处理文件
+        saved_records = []
+        record_id = 1
+
+        for file in files:
+            if not file.filename:
+                continue
+
+            match = filename_to_record.get(file.filename)
+            if not match:
+                continue
+
+            ext = os.path.splitext(file.filename)[1] or ".jpg"
+            new_filename = secrets.token_hex(3) + ext
+
+            save_path = os.path.join(upload_folder, new_filename)
+            with open(save_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            saved_records.append({
+                "id": record_id,
+                "filename": file.filename,
+                "new_filename": new_filename,
+                "disease_en": match.get("disease_en", ""),
+                "disease_zh": match.get("disease_zh", ""),
+                "confidence": match.get("confidence", 0.0)
+            })
+            record_id += 1
+
+        # 写入 metadata.json
+        metadata = {
+            "uploaded_at": datetime.now().isoformat(),
+            "num": num,
+            "upload_number": upload_number,
+            "folder_name": folder_name,
+            "rows": rows,
+            "cols": cols,
+            "selected_disease": selected_disease,
+            "overall_confidence": overall_confidence,
+            "records": saved_records
+        }
+        metadata_path = os.path.join(upload_folder, "metadata.json")
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+        return JSONResponse(content={
+            "success": True,
+            "account_id": account_id,
+            "upload_number": upload_number,
+            "folder_name": folder_name,
+            "total_files": len(saved_records),
+            "records": saved_records
+        })
+
+    except Exception as e:
+        return JSONResponse(content={"error": f"上传失败：{str(e)}"}, status_code=500)
+
+
+@app.get("/api/localupload/history")
+async def local_upload_history(
+    user: dict = Depends(get_current_user),
+    num: int | None = None
+):
+    """
+    查询本地检测上传历史（JWT 鉴权）
+
+    扫描 image/{account_id}/ 下所有本地上传文件夹（命名格式：{num}_{timestamp}），
+    读取 metadata.json 返回完整历史记录。
+    可选 ?num=N 筛选指定第 N 次检测记录。
+    """
+    try:
+        account_id = user.get("account", "")
+        if not account_id or any(c in account_id for c in ('/', '\\', '..')):
+            return JSONResponse(content={"error": "账号ID无效"}, status_code=400)
+
+        account_folder = os.path.join(config.IMAGE_FOLDER, account_id)
+
+        if not os.path.exists(account_folder):
+            return JSONResponse(content={
+                "success": True,
+                "account_id": account_id,
+                "total_uploads": 0,
+                "uploads": []
+            })
+
+        # 匹配 {num}_{YYYYMMDD}_{HHmmss} 格式的文件夹
+        local_pattern = re.compile(r'^(\d+)_(\d{8})_(\d{6})$')
+
+        uploads = []
+        for folder_name in sorted(os.listdir(account_folder)):
+            folder_path = os.path.join(account_folder, folder_name)
+            if not os.path.isdir(folder_path):
+                continue
+
+            m = local_pattern.match(folder_name)
+            if not m:
+                continue
+
+            folder_num = int(m.group(1))
+
+            # 可选筛选
+            if num is not None and folder_num != num:
+                continue
+
+            metadata_path = os.path.join(folder_path, "metadata.json")
+            meta = {}
+
+            if os.path.exists(metadata_path):
+                try:
+                    with open(metadata_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                except (json.JSONDecodeError, Exception):
+                    meta = {}
+
+            # 统计图片文件
+            image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+            image_files = [
+                f for f in os.listdir(folder_path)
+                if os.path.splitext(f)[1].lower() in image_exts
+            ]
+
+            # 组装 records（含图片访问 URL）
+            records_out = []
+            for rec in meta.get("records", []):
+                new_fn = rec.get("new_filename", "")
+                records_out.append({
+                    "id": rec.get("id"),
+                    "filename": rec.get("filename"),
+                    "new_filename": new_fn,
+                    "disease_en": rec.get("disease_en"),
+                    "disease_zh": rec.get("disease_zh"),
+                    "confidence": rec.get("confidence"),
+                    "image_url": f"/api/exeupload/image/{account_id}/{folder_name}/{new_fn}" if new_fn else None
+                })
+
+            uploads.append({
+                "num": meta.get("num", folder_num),
+                "upload_number": meta.get("upload_number"),
+                "folder_name": folder_name,
+                "uploaded_at": meta.get("uploaded_at"),
+                "rows": meta.get("rows"),
+                "cols": meta.get("cols"),
+                "selected_disease": meta.get("selected_disease"),
+                "overall_confidence": meta.get("overall_confidence"),
+                "total_files": len(image_files),
+                "records": records_out
+            })
+
+        # 按 num 降序（最新的在前）
+        uploads.sort(key=lambda x: x.get("num", 0), reverse=True)
+
+        return JSONResponse(content={
+            "success": True,
+            "account_id": account_id,
+            "total_uploads": len(uploads),
+            "uploads": uploads
+        })
+
+    except Exception as e:
+        return JSONResponse(content={"error": f"查询失败：{str(e)}"}, status_code=500)
 
 
 @app.get("/api/result")
