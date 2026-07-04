@@ -7,5 +7,5 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- 插入一条测试数据（密码明文）
 INSERT INTO users (account, password, description)
-VALUES ('admin', '123456', '管理员')
+VALUES ('abc', '123456', '第一天对接的果园')
 ON CONFLICT (account) DO NOTHING;

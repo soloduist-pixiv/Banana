@@ -3,22 +3,21 @@ from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from config import Config
-from database import get_pool
+from database import get_db
 
 security = HTTPBearer()
 
 
 async def verify_user(account: str, password: str):
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id, account, description FROM users WHERE account = $1 AND password = $2",
-            account,
-            password,
-        )
+    db = get_db()
+    cursor = await db.execute(
+        "SELECT id, account, description FROM users WHERE account = ? AND password = ?",
+        (account, password),
+    )
+    row = await cursor.fetchone()
     if row is None:
         return None
-    return {"id": row["id"], "account": row["account"], "description": row["description"]}
+    return {"id": row[0], "account": row[1], "description": row[2]}
 
 
 def create_token(user_id: int, account: str, description: str) -> str:

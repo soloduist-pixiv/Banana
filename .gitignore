@@ -27,4 +27,23 @@ Thumbs.db
 *.local
 
 # Model files (large binary files)
-# *.pth  # 取消注释以排除模型文件
+# *.pth
+
+# Working copy directory (local development)
+Banana/
+bin/
+lib/
+lib64
+pyvenv.cfg
+include/
+
+# Database
+*.db
+*.db-journal
+
+# Logs
+*.log
+
+# Uploads
+uploads/
+image/

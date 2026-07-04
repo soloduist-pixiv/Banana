@@ -9,7 +9,6 @@ import os
 import re
 import torch
 import torch.nn as nn
-from torchvision import transforms, models
 from PIL import Image
 import numpy as np
 from virtual_orchard import CLASS_NAMES
@@ -41,12 +40,18 @@ class LoginRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    await init_db()
+    try:
+        await init_db()
+    except Exception as e:
+        print(f"数据库连接失败（API 仍可启动）: {e}")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    await close_db()
+    try:
+        await close_db()
+    except Exception as e:
+        print(f"数据库关闭异常: {e}")
 
 
 os.makedirs(config.UPLOAD_FOLDER, exist_ok=True)
@@ -57,6 +62,9 @@ USER_MODEL_PATH = 'shufflenet_v2_dropout_best第9次.pth'
 # 真实模型预测
 def predict_disease(image_path):
     """使用训练好的模型进行病害预测"""
+    # 延迟导入 torchvision（避免缺少 _lzma 导致启动失败）
+    from torchvision import transforms, models
+
     # 图像预处理（与训练时保持一致）
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -368,6 +376,9 @@ async def is_banana(file: UploadFile = File(...)):
     - 预测规则：取概率最大的类别作为最终预测结果
     """
     try:
+        # 延迟导入 torchvision
+        from torchvision import transforms, models
+
         if not file.filename:
             return JSONResponse(content={"error": "未选择文件"}, status_code=400)
         
@@ -440,6 +451,15 @@ async def is_banana(file: UploadFile = File(...)):
             "predicted_class": predicted_class.item()
         })
         
+    except ImportError:
+        # torchvision 不可用（缺少 _lzma），使用备用判断
+        return JSONResponse(content={
+            "is_banana": False,
+            "confidence": 0.0,
+            "predicted_class": -1,
+            "fallback": True,
+            "message": "模型不可用（缺少 _lzma 系统库），已返回默认结果"
+        })
     except Exception as e:
         return JSONResponse(content={"error": f"处理失败：{str(e)}"}, status_code=500)
 
