@@ -38,6 +38,13 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class SamplePlanRequest(BaseModel):
+    rows: int
+    cols: int
+    selected_disease: str
+    sample_count: int | None = None  # None = 自动计算
+
+
 @app.on_event("startup")
 async def startup():
     try:
@@ -159,6 +166,77 @@ def predict_disease_fallback(image_path):
     
     return predicted_disease, confidence
 
+def plan_sampling_path(rows: int, cols: int, sample_count: int | None = None) -> list[dict]:
+    """
+    生成最优采样路径：网格分层选点 + 最近邻贪心排序
+
+    算法分两步：
+    1. 网格分层选点 — 将果园等分为 K 个区块，每块取中心点，确保空间覆盖均匀
+    2. 最近邻 TSP — 从 (0,0) 入口出发，每次贪心去最近的未访问点
+
+    Args:
+        rows: 果园行数
+        cols: 果园列数
+        sample_count: 采样点数量，None 则自动计算（√总面积，最少 3 个）
+
+    Returns:
+        [{"order": 1, "row": r, "col": c}, ...]  有序采样点列表
+    """
+    total_trees = rows * cols
+
+    # ---------- 自动确定采样数量 ----------
+    if sample_count is None:
+        # √总面积，最少 3 个，无上限（随果园规模自然增长）
+        sample_count = max(3, round(total_trees ** 0.5))
+    sample_count = max(1, min(sample_count, total_trees))
+
+    # ---------- 第一步：网格分层选点 ----------
+    if sample_count >= total_trees:
+        # 小果园：全部采样
+        points = [(r, c) for r in range(1, rows + 1) for c in range(1, cols + 1)]
+    else:
+        # 将 K 分解为 grid_rows × grid_cols，尽量接近正方形
+        grid_rows = round(sample_count ** 0.5)
+        grid_cols = max(1, round(sample_count / grid_rows))
+        # 确保网格块数 ≥ sample_count
+        while grid_rows * grid_cols < sample_count:
+            grid_cols += 1
+
+        block_h = rows / grid_rows
+        block_w = cols / grid_cols
+
+        points_set: set[tuple[int, int]] = set()
+        for gr in range(grid_rows):
+            for gc in range(grid_cols):
+                # 区块中心坐标（1-indexed）
+                r = round(gr * block_h + block_h / 2 + 0.5)
+                c = round(gc * block_w + block_w / 2 + 0.5)
+                r = max(1, min(rows, r))
+                c = max(1, min(cols, c))
+                points_set.add((r, c))
+
+        # 截断到目标数量
+        points = list(points_set)[:sample_count]
+
+    # ---------- 第二步：最近邻贪心排序 ----------
+    ordered: list[tuple[int, int]] = []
+    remaining: set[tuple[int, int]] = set(points)
+    current = (0, 0)  # 果园入口
+
+    while remaining:
+        # 找距离当前点最近的未访问点（平方欧几里得，避免 sqrt）
+        nearest = min(remaining, key=lambda p:
+                      (p[0] - current[0]) ** 2 + (p[1] - current[1]) ** 2)
+        ordered.append(nearest)
+        remaining.remove(nearest)
+        current = nearest
+
+    return [
+        {"order": i + 1, "row": r, "col": c}
+        for i, (r, c) in enumerate(ordered)
+    ]
+
+
 # 病害特征描述
 disease_features = [
     {
@@ -210,7 +288,11 @@ async def init_orchard(request: Request, rows: int = Form(...), cols: int = Form
         for j in range(cols):
             row.append({"row": i+1, "col": j+1, "status": "unknown"})
         orchard_layout.append(row)
-    
+
+    # 清除抽样模式的计划数据，防止两个模式互相污染
+    session_data.pop('sample_plan', None)
+    session_data.pop('sample_index', None)
+
     session_data['rows'] = rows
     session_data['cols'] = cols
     session_data['orchard_layout'] = orchard_layout
@@ -242,77 +324,208 @@ async def select_disease(request: Request, disease: str = Form(...)):
         "selected_disease": disease
     })
 
+
+@app.post("/api/sample/plan")
+async def sample_plan(body: SamplePlanRequest):
+    """
+    智能采样路径规划
+
+    合并原 orchard/init + disease/select 功能，
+    通过网格分层选点 + 最近邻贪心排序生成最优检测路径，
+    让检测员按最短路径走完所有采样点，避免在果园里来回跑。
+    """
+    rows = body.rows
+    cols = body.cols
+    selected_disease = body.selected_disease.strip()
+
+    if rows < 1 or cols < 1:
+        return JSONResponse(content={"error": "rows 和 cols 必须 ≥ 1"}, status_code=400)
+    if rows > 100 or cols > 100:
+        return JSONResponse(content={"error": "rows 和 cols 不能超过 100"}, status_code=400)
+    if not selected_disease:
+        return JSONResponse(content={"error": "selected_disease 不能为空"}, status_code=400)
+
+    # 生成采样路径
+    sample_plan_list = plan_sampling_path(rows, cols, body.sample_count)
+
+    # 初始化果园布局
+    orchard_layout = []
+    for i in range(rows):
+        row = []
+        for j in range(cols):
+            row.append({"row": i + 1, "col": j + 1, "status": "unknown"})
+        orchard_layout.append(row)
+
+    # 初始化 session
+    session_data['rows'] = rows
+    session_data['cols'] = cols
+    session_data['orchard_layout'] = orchard_layout
+    session_data['confidence'] = 0.0
+    session_data['disease_info'] = []
+    session_data['sample_count'] = 0
+    session_data['selected_disease'] = selected_disease
+    session_data['sample_plan'] = sample_plan_list
+    session_data['sample_index'] = 0  # 当前已推进到第几个点
+    session_data['current_sample'] = {
+        "row": sample_plan_list[0]["row"],
+        "col": sample_plan_list[0]["col"],
+    }
+
+    return JSONResponse(content={
+        "success": True,
+        "rows": rows,
+        "cols": cols,
+        "total_samples": len(sample_plan_list),
+        "sample_plan": sample_plan_list,
+        "current_sample": sample_plan_list[0],
+        "selected_disease": selected_disease,
+        "disease_features": disease_features,
+    })
+
+
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
-    """步骤3：上传照片"""
+    """
+    逐点检测上传（配合 orchard/init + disease/select 使用）
+
+    随机选点 → 拍照推理 → 给下一个随机点。
+    完成条件：5 个点 或 3 个点后置信度 ≥ 95%。
+    """
     try:
-        if not file.filename:
-            return JSONResponse(content={"error": "未选择文件"}, status_code=400)
-        
-        # 检查会话数据
         if 'current_sample' not in session_data:
             return JSONResponse(content={"error": "会话已过期，请重新开始"}, status_code=400)
-        
-        # 保存文件
-        filename = f"sample_{session_data['current_sample']['row']}_{session_data['current_sample']['col']}.jpg"
-        file_path = os.path.join(config.UPLOAD_FOLDER, filename)
-        
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        # 预测病害
-        try:
-            predicted_disease, confidence = predict_disease(file_path)
-        except Exception as e:
-            print(f"预测失败：{e}，尝试使用备用方案")
-            predicted_disease, confidence = predict_disease_fallback(file_path)
-        
-        # 更新果园布局
-        row = session_data['current_sample']['row'] - 1
-        col = session_data['current_sample']['col'] - 1
-        session_data['orchard_layout'][row][col]['status'] = predicted_disease
-        session_data['orchard_layout'][row][col]['confidence'] = confidence
-        
-        # 保存病害信息
-        session_data['disease_info'].append({
-            "row": session_data['current_sample']['row'],
-            "col": session_data['current_sample']['col'],
-            "disease": predicted_disease,
-            "confidence": confidence
-        })
-        
-        # 增加采样计数
-        session_data['sample_count'] += 1
-        
-        # 计算整体置信度
-        if session_data['disease_info']:
-            avg_confidence = sum(item['confidence'] for item in session_data['disease_info']) / len(session_data['disease_info'])
-            session_data['confidence'] = avg_confidence
-        
-        # 检查是否完成
+
+        predicted_disease, confidence = _do_upload(file, session_data['current_sample'], session_data, config)
+        if predicted_disease is None:
+            return JSONResponse(content={"error": confidence}, status_code=400)
+
+        # 完成条件：5 个点 或 ≥3 个点且置信度 ≥95%
         completed = (session_data['confidence'] >= 0.95 and session_data['sample_count'] >= 3) or session_data['sample_count'] >= 5
-        
+
         response_data = {
             "success": True,
             "predicted_disease": predicted_disease,
             "confidence": confidence,
             "overall_confidence": session_data['confidence'],
-            "completed": completed
+            "completed": completed,
         }
-        
+
         if not completed:
-            # 生成新的采样点
             rows = session_data['rows']
             cols = session_data['cols']
             sample_row = random.randint(1, rows)
             sample_col = random.randint(1, cols)
             session_data['current_sample'] = {"row": sample_row, "col": sample_col}
             response_data["next_sample"] = {"row": sample_row, "col": sample_col}
-            
+
         return JSONResponse(content=response_data)
-        
+
     except Exception as e:
         return JSONResponse(content={"error": f"上传失败：{str(e)}"}, status_code=500)
+
+
+def _do_upload(file, current_sample, session_data, config):
+    """
+    通用上传处理：保存文件 → 模型推理 → 更新 session
+
+    供 /api/upload 和 /api/sample/upload 共用，避免重复代码。
+    返回 (predicted_disease, confidence)
+    """
+    if not file.filename:
+        return None, "未选择文件"
+
+    row = current_sample['row']
+    col = current_sample['col']
+    filename = f"sample_{row}_{col}.jpg"
+    file_path = os.path.join(config.UPLOAD_FOLDER, filename)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # 预测病害
+    try:
+        predicted_disease, confidence = predict_disease(file_path)
+    except Exception as e:
+        print(f"预测失败：{e}，尝试使用备用方案")
+        predicted_disease, confidence = predict_disease_fallback(file_path)
+
+    # 更新果园布局
+    session_data['orchard_layout'][row - 1][col - 1]['status'] = predicted_disease
+    session_data['orchard_layout'][row - 1][col - 1]['confidence'] = confidence
+
+    # 保存病害信息
+    session_data['disease_info'].append({
+        "row": row,
+        "col": col,
+        "disease": predicted_disease,
+        "confidence": confidence
+    })
+
+    # 增加采样计数
+    session_data['sample_count'] += 1
+
+    # 计算整体置信度
+    if session_data['disease_info']:
+        avg_confidence = sum(item['confidence'] for item in session_data['disease_info']) / len(session_data['disease_info'])
+        session_data['confidence'] = avg_confidence
+
+    return predicted_disease, confidence
+
+
+@app.post("/api/sample/upload")
+async def sample_upload(file: UploadFile = File(...)):
+    """
+    抽样检测专用上传（配合 /api/sample/plan 使用）
+
+    按 sample_plan 的计划顺序推进，走完所有计划点即完成。
+    不走随机逻辑，与逐点检测的 /api/upload 完全独立。
+    """
+    try:
+        sample_plan = session_data.get('sample_plan')
+        if not sample_plan:
+            return JSONResponse(
+                content={"error": "未找到抽样计划，请先调用 /api/sample/plan"},
+                status_code=400,
+            )
+
+        current_sample = session_data.get('current_sample')
+        if not current_sample:
+            return JSONResponse(
+                content={"error": "会话已过期，请重新调用 /api/sample/plan"},
+                status_code=400,
+            )
+
+        predicted_disease, confidence = _do_upload(file, current_sample, session_data, config)
+        if predicted_disease is None:
+            return JSONResponse(content={"error": confidence}, status_code=400)
+
+        # 走完所有计划点即完成
+        plan_total = len(sample_plan)
+        completed = session_data['sample_count'] >= plan_total
+
+        response_data = {
+            "success": True,
+            "predicted_disease": predicted_disease,
+            "confidence": confidence,
+            "overall_confidence": session_data['confidence'],
+            "completed": completed,
+        }
+
+        if not completed:
+            # 推进到计划中的下一个点
+            next_index = session_data['sample_count']  # 下一个点的序号 = 已采样数
+            next_point = sample_plan[next_index]
+            session_data['current_sample'] = {
+                "row": next_point["row"],
+                "col": next_point["col"],
+            }
+            response_data["next_sample"] = next_point
+
+        return JSONResponse(content=response_data)
+
+    except Exception as e:
+        return JSONResponse(content={"error": f"上传失败：{str(e)}"}, status_code=500)
+
 
 def predict_orchard_disease(orchard_layout, disease_info, rows, cols):
     """基于病害传播模型预测整个果园的病害分布"""
